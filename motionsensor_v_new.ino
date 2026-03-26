@@ -8,10 +8,9 @@
 #include <ArduinoOTA.h>
 #include <WiFiUdp.h>
 #include <time.h>
-// Reduce PubSubClient socket timeout from 15s default to prevent WDT resets
-#define MQTT_SOCKET_TIMEOUT 3
 #include <PubSubClient.h>
 #include "esp_wifi.h"
+#include "esp_task_wdt.h"
 #include "arduino_secrets.h"
 
 // ================= Logging =================
@@ -117,6 +116,15 @@ bool relayActive              = false;
 bool relayOutput              = false;
 unsigned long relayStartMs    = 0;
 unsigned long lastFlashToggle = 0;
+
+// ================= Hardware Timer WDT Kicker =================
+hw_timer_t *wdtTimer = NULL;
+
+void IRAM_ATTR onWdtTimer() {
+  static bool state = false;
+  state = !state;
+  digitalWrite(WDT_KICK_PIN, state);
+}
 
 // ================= Forward Decls =================
 void kickWatchdog();
@@ -374,6 +382,9 @@ void manageMqtt() {
   if (WiFi.status() != WL_CONNECTED || !mqttReady) return;
 
   if (!mqtt.connected()) {
+    // Skip MQTT reconnect during relay flash phase — avoid blocking the loop
+    if (relayActive && (millis() - relayStartMs >= RELAY_SOLID_MS)) return;
+
     if (millis() - lastMqttAttempt < MQTT_RETRY_DELAY_MS) return;
     lastMqttAttempt = millis();
 
@@ -446,6 +457,11 @@ void setup() {
   lastWdtEdgeMs = millis();
   lastWdtKick   = millis();
 
+  // Hardware timer toggles WDT pin every 2s independent of main loop
+  wdtTimer = timerBegin(1000000);  // 1 MHz
+  timerAttachInterrupt(wdtTimer, &onWdtTimer);
+  timerAlarm(wdtTimer, 2000000, true, 0);  // 2s, auto-reload
+
   safeDelay(500);
 
   pinMode(PIR_PIN, INPUT_PULLDOWN);
@@ -482,6 +498,7 @@ void loop() {
 
         udpSyslog.begin(SYSLOG_LOCAL_PORT);
         mqtt.setServer(MQTT_HOST, MQTT_PORT);
+        mqtt.setSocketTimeout(3);
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
         ntpConfigured = true;
