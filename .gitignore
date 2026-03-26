@@ -1,0 +1,26 @@
+# Secrets (VERY IMPORTANT)
+arduino_secret.h
+
+# Arduino build artifacts
+*.hex
+*.bin
+*.elf
+
+# Arduino IDE / CLI temp files
+*.ino.cpp
+*.ino.cpp.d
+*.o
+*.d
+
+# VS Code (if you ever use it)
+.vscode/
+
+# macOS junk (just in case)
+.DS_Store
+
+# Linux temp files
+*~
+*.swp
+
+# Logs
+*.log
