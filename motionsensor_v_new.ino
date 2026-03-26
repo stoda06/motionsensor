@@ -8,6 +8,8 @@
 #include <ArduinoOTA.h>
 #include <WiFiUdp.h>
 #include <time.h>
+// Reduce PubSubClient socket timeout from 15s default to prevent WDT resets
+#define MQTT_SOCKET_TIMEOUT 3
 #include <PubSubClient.h>
 #include "esp_wifi.h"
 #include "arduino_secrets.h"
@@ -376,10 +378,17 @@ void manageMqtt() {
     lastMqttAttempt = millis();
 
     String cid = "motion-" + WiFi.macAddress();
+    kickWatchdog();
+    unsigned long mqttConnStart = millis();
     if (mqtt.connect(cid.c_str())) {
+      kickWatchdog();
       logMsg(String(EMO_OK) + " MQTT connected");
       mqtt.publish("motion/status", "online", true);
     } else {
+      kickWatchdog();
+      if (millis() - mqttConnStart > 1000) {
+        logMsg("⚠️ MQTT connect blocked: " + String(millis() - mqttConnStart) + " ms");
+      }
       logMsg(String(EMO_WIFI_WARN) + " MQTT connect failed (rc="
              + String(mqtt.state()) + ") will retry in "
              + String(MQTT_RETRY_DELAY_MS / 1000) + "s");
@@ -430,14 +439,16 @@ void setup() {
   initStartMs = millis();
 
   Serial.begin(115200);
+
+  // Init WDT pin BEFORE safeDelay so kickWatchdog() can use it
+  pinMode(WDT_KICK_PIN, OUTPUT);
+  digitalWrite(WDT_KICK_PIN, LOW);
+
   safeDelay(500);
 
   pinMode(PIR_PIN, INPUT_PULLDOWN);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, !RELAY_ACTIVE_HIGH);
-
-  pinMode(WDT_KICK_PIN, OUTPUT);
-  digitalWrite(WDT_KICK_PIN, LOW);
 
   logMsg("System initialized (staggered startup)");
 
@@ -483,7 +494,9 @@ void loop() {
 
     // OTA with timing instrumentation
     unsigned long otaStart = millis();
+    kickWatchdog();
     ArduinoOTA.handle();
+    kickWatchdog();
     if (millis() - otaStart > 1000) {
       logMsg("⚠️ OTA blocking: " + String(millis() - otaStart) + " ms");
     }
