@@ -443,6 +443,8 @@ void setup() {
   // Init WDT pin BEFORE safeDelay so kickWatchdog() can use it
   pinMode(WDT_KICK_PIN, OUTPUT);
   digitalWrite(WDT_KICK_PIN, LOW);
+  lastWdtEdgeMs = millis();
+  lastWdtKick   = millis();
 
   safeDelay(500);
 
