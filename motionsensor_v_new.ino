@@ -8,10 +8,11 @@
 #include <ArduinoOTA.h>
 #include <WiFiUdp.h>
 #include <time.h>
-// Reduce PubSubClient socket timeout from 15s default to prevent WDT resets
-#define MQTT_SOCKET_TIMEOUT 3
+#define MQTT_SOCKET_TIMEOUT          2
 #include <PubSubClient.h>
 #include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "arduino_secrets.h"
 
 // ================= Logging =================
@@ -35,10 +36,10 @@
 #define WIFI_PASSWORD  SECRET_PASS
 
 // ================= Configuration =================
-#define WIFI_CONNECT_TIMEOUT_MS  15000
+#define WIFI_CONNECT_TIMEOUT_MS   8000
 #define WIFI_RETRY_DELAY_MS      15000
-#define WIFI_RECONNECT_DELAY_MS  500
-#define MQTT_RETRY_DELAY_MS      5000
+#define WIFI_RECONNECT_DELAY_MS    500
+#define MQTT_RETRY_DELAY_MS       8000
 
 // ================= OTA =================
 #define OTA_HOSTNAME  "motion-sensor"
@@ -59,9 +60,10 @@
 #define WDT_MAX_DELAY_MS      5000
 
 // ================= MQTT =================
-#define MQTT_HOST  "192.168.1.100"
-#define MQTT_PORT  1883
-#define MQTT_TOPIC "front/motion"
+#define MQTT_HOST          "192.168.1.100"
+#define MQTT_PORT          1883
+#define MQTT_TOPIC         "front/motion"
+#define MQTT_CONTROL_TOPIC "front/motion/control"
 
 // ================= Syslog =================
 #define SYSLOG_HOST       "192.168.1.100"
@@ -70,7 +72,7 @@
 
 // ================= Timing =================
 #define HEARTBEAT_INTERVAL 60
-#define RELAY_SOLID_MS     (2UL * 60UL * 1000UL)
+#define RELAY_SOLID_MS     (8UL * 60UL * 1000UL)
 #define RELAY_FLASH_MS     (2UL * 60UL * 1000UL)
 #define RELAY_FLASH_INT    500
 
@@ -83,6 +85,7 @@ unsigned long bootMs          = 0;
 unsigned long lastHeartbeat   = 0;
 unsigned long lastMqttAttempt = 0;
 unsigned long lastWdtKick     = 0;
+bool inFlashPhase = false;
 
 // ================= Feature State =================
 bool syslogReady      = false;
@@ -92,14 +95,14 @@ bool mqttReady        = false;
 bool otaStarted       = false;
 
 // ================= Staggered Init =================
-unsigned long initStartMs       = 0;
-bool wifiInitStarted            = false;
-bool servicesInitStarted        = false;
+unsigned long initStartMs    = 0;
+bool wifiInitStarted         = false;
+bool servicesInitStarted     = false;
 
 // ================= Watchdog Debug =================
-unsigned long lastWdtLog     = 0;
-unsigned long lastWdtEdgeMs  = 0;
-bool          lastWdtState   = false;
+unsigned long lastWdtLog    = 0;
+unsigned long lastWdtEdgeMs = 0;
+bool          lastWdtState  = false;
 
 // ================= Loop timing debug =================
 unsigned long lastLoopStart = 0;
@@ -120,9 +123,12 @@ unsigned long lastFlashToggle = 0;
 
 // ================= Forward Decls =================
 void kickWatchdog();
+void wdtStatusLog();
 void logMsg(const String &msg);
+void logResetReason();
 void setupOTA();
 void setRelay(bool on, bool silent = false);
+void startRelayCycle();
 
 // ================= Safe Delay =================
 void safeDelay(unsigned long ms) {
@@ -138,31 +144,43 @@ void kickWatchdog() {
   unsigned long now = millis();
 
   if (now - lastWdtKick >= WDT_KICK_INTERVAL_MS) {
-    lastWdtKick = now;
-
+    lastWdtKick   = now;
     bool newState = !digitalRead(WDT_KICK_PIN);
     digitalWrite(WDT_KICK_PIN, newState);
-
-    unsigned long delta = now - lastWdtEdgeMs;
     lastWdtEdgeMs = now;
-
-    if (delta > WDT_MAX_DELAY_MS) {
-      logMsg("⚠️ WDT DELAY anomaly: " + String(delta) + " ms");
-    }
-
-    lastWdtState = newState;
+    lastWdtState  = newState;
   }
+}
 
+// ================= WDT Status Log =================
+void wdtStatusLog() {
+  unsigned long now = millis();
   if (now - lastWdtLog >= WDT_DEBUG_INTERVAL) {
     lastWdtLog = now;
-
     logMsg(
-      String("🧠 WDT status: state=") +
+      String("WDT status: state=") +
       (lastWdtState ? "HIGH" : "LOW") +
       " last_toggle_ms=" + String(lastWdtEdgeMs) +
       " now=" + String(now)
     );
   }
+}
+
+// ================= Reset Reason =================
+void logResetReason() {
+  esp_reset_reason_t reason = esp_reset_reason();
+  String r;
+  switch (reason) {
+    case ESP_RST_POWERON:  r = "Power on";        break;
+    case ESP_RST_SW:       r = "Software reset";  break;
+    case ESP_RST_PANIC:    r = "Panic/exception"; break;
+    case ESP_RST_INT_WDT:  r = "Interrupt WDT";   break;
+    case ESP_RST_TASK_WDT: r = "Task WDT";        break;
+    case ESP_RST_WDT:      r = "Other WDT";       break;
+    case ESP_RST_BROWNOUT: r = "Brownout";        break;
+    default:               r = "Unknown (" + String(reason) + ")"; break;
+  }
+  logMsg("Reset reason: " + r);
 }
 
 // ================= Time / Logging =================
@@ -184,7 +202,7 @@ void logMsg(const String &msg) {
   String line = ts() + " " + ip + " [motion-sensor] [INFO] " + msg;
   LOG_SERIAL.println(line);
 
-  if (!syslogReady || WiFi.status() != WL_CONNECTED) return;
+  if (!syslogReady || WiFi.status() != WL_CONNECTED || inFlashPhase) return;
 
   udpSyslog.beginPacket(SYSLOG_HOST, SYSLOG_PORT);
   udpSyslog.print("<134>");
@@ -212,6 +230,27 @@ void checkTimeSync() {
   }
 }
 
+// ================= MQTT Callback =================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  logMsg("MQTT rx [" + String(topic) + "]: " + msg);
+
+  if (String(topic) == MQTT_CONTROL_TOPIC) {
+    if (msg == "relay_off") {
+      relayActive = false;
+      setRelay(false);
+      logMsg(String(EMO_RELAY) + " Relay forced OFF via MQTT");
+    } else if (msg == "relay_on") {
+      startRelayCycle();
+      logMsg(String(EMO_RELAY) + " Relay forced ON via MQTT");
+    }
+  }
+}
+
 // ================= WiFi =================
 void connectWiFi() {
   logMsg("=== connectWiFi() start ===");
@@ -232,16 +271,13 @@ void connectWiFi() {
 
   logMsg("MAC: " + WiFi.macAddress());
 
-  // Optional scan path retained but disabled by default for stability
   bool useScan = false;
-
   int bestChan = 0;
   uint8_t bestBSSID[6];
   bool found = false;
 
   if (useScan) {
     logMsg(String(EMO_SCAN) + " Scanning for: " + WIFI_SSID);
-
     int n = WiFi.scanNetworks();
     kickWatchdog();
 
@@ -251,13 +287,11 @@ void connectWiFi() {
     }
 
     int bestRSSI = -999;
-
     for (int i = 0; i < n; i++) {
       if (WiFi.SSID(i) == WIFI_SSID) {
         logMsg(String(EMO_WIFI_OK) + " Found \"" + WIFI_SSID + "\" RSSI: "
                + String(WiFi.RSSI(i)) + " dBm  CH:" + String(WiFi.channel(i))
                + "  BSSID:" + WiFi.BSSIDstr(i));
-
         if (WiFi.RSSI(i) > bestRSSI) {
           bestRSSI = WiFi.RSSI(i);
           bestChan = WiFi.channel(i);
@@ -266,7 +300,6 @@ void connectWiFi() {
         found = true;
       }
     }
-
     WiFi.scanDelete();
 
     if (!found) {
@@ -286,24 +319,21 @@ void connectWiFi() {
   WiFi.setAutoReconnect(false);
 
   unsigned long start = millis();
-
   while (WiFi.status() != WL_CONNECTED &&
          millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    kickWatchdog();
     safeDelay(500);
     LOG_SERIAL.print(".");
   }
-
   LOG_SERIAL.println();
 
   if (WiFi.status() == WL_CONNECTED) {
     logMsg(String(EMO_WIFI_OK) + " WiFi connected, IP "
            + WiFi.localIP().toString());
-
-    wifiWasConnected = true;
+    wifiWasConnected    = true;
     servicesInitStarted = true;
-    initStartMs = millis();
-
-    logMsg("WiFi stage complete — services will start shortly");
+    initStartMs         = millis();
+    logMsg("WiFi stage complete - services will start shortly");
   } else {
     logMsg(String(EMO_WIFI_WARN) + " WiFi connect failed, will retry in "
            + String(WIFI_RETRY_DELAY_MS / 1000) + "s");
@@ -343,19 +373,19 @@ void setupOTA() {
 #endif
 
   ArduinoOTA.onStart([]() {
-    logMsg("⬆️ OTA update starting — suspending relay");
+    logMsg("OTA update starting - suspending relay");
     setRelay(false);
   });
 
   ArduinoOTA.onEnd([]() {
-    logMsg("⬆️ OTA update complete, rebooting");
+    logMsg("OTA update complete, rebooting");
   });
 
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     static unsigned int lastPct = 0;
     unsigned int pct = (total == 0) ? 0 : (progress / (total / 100 == 0 ? 1 : total / 100));
     if (pct != lastPct && pct % 10 == 0) {
-      logMsg("⬆️ OTA progress: " + String(pct) + "%");
+      logMsg("OTA progress: " + String(pct) + "%");
       lastPct = pct;
     }
   });
@@ -366,7 +396,7 @@ void setupOTA() {
 
   ArduinoOTA.begin();
   otaStarted = true;
-  logMsg("⬆️ OTA ready — hostname: " + String(OTA_HOSTNAME));
+  logMsg("OTA ready - hostname: " + String(OTA_HOSTNAME));
 }
 
 // ================= MQTT =================
@@ -384,10 +414,11 @@ void manageMqtt() {
       kickWatchdog();
       logMsg(String(EMO_OK) + " MQTT connected");
       mqtt.publish("motion/status", "online", true);
+      mqtt.subscribe(MQTT_CONTROL_TOPIC);
     } else {
       kickWatchdog();
       if (millis() - mqttConnStart > 1000) {
-        logMsg("⚠️ MQTT connect blocked: " + String(millis() - mqttConnStart) + " ms");
+        logMsg("MQTT connect blocked: " + String(millis() - mqttConnStart) + " ms");
       }
       logMsg(String(EMO_WIFI_WARN) + " MQTT connect failed (rc="
              + String(mqtt.state()) + ") will retry in "
@@ -404,7 +435,7 @@ void startRelayCycle() {
   relayStartMs    = millis();
   lastFlashToggle = millis();
   setRelay(true);
-  logMsg(String(EMO_RELAY) + " Relay cycle started — solid for " +
+  logMsg(String(EMO_RELAY) + " Relay cycle started - solid for " +
          String(RELAY_SOLID_MS / 1000) + "s");
 }
 
@@ -417,32 +448,58 @@ void updateRelay() {
   if (elapsed < RELAY_SOLID_MS + RELAY_FLASH_MS) {
     if (millis() - lastFlashToggle >= RELAY_FLASH_INT) {
       if (lastFlashToggle == relayStartMs) {
-        logMsg(String(EMO_FLASH) + " Relay entering flash phase — " +
+        logMsg(String(EMO_FLASH) + " Relay entering flash phase - " +
                String(RELAY_FLASH_MS / 1000) + "s");
       }
       lastFlashToggle = millis();
       setRelay(!relayOutput, true);
+
+      logMsg(
+        "FLASH tick: elapsed=" + String(elapsed) +
+        "ms relay=" + String(relayOutput ? "ON" : "OFF") +
+        " heap=" + String(ESP.getFreeHeap()) +
+        " loopDelta=" + String(millis() - lastLoopStart) +
+        " wdtAge=" + String(millis() - lastWdtKick) + "ms"
+      );
     }
     return;
   }
 
+  // Flash phase complete
   relayActive = false;
   setRelay(false);
-  logMsg("🛑 Relay cycle complete");
+  logMsg("Relay cycle complete");
+
+  // Force WiFi reconnect to flush stack state
+  wifiWasConnected    = false;
+  servicesInitStarted = false;
+  mqttReady           = false;
+  otaStarted          = false;
+  syslogReady         = false;
+  WiFi.disconnect(true);
+  lastWifiAttempt     = millis();
 }
 
 // ================= Setup =================
 void setup() {
-  delay(5000);
-
-  bootMs = millis();
-  initStartMs = millis();
-
   Serial.begin(115200);
 
-  // Init WDT pin BEFORE safeDelay so kickWatchdog() can use it
+  unsigned long t = millis();
+  while (!Serial && (millis() - t < 10000)) {
+    delay(10);
+  }
+
+  delay(500);
+  bootMs      = millis();
+  initStartMs = millis();
+
   pinMode(WDT_KICK_PIN, OUTPUT);
   digitalWrite(WDT_KICK_PIN, LOW);
+  lastWdtEdgeMs = millis();
+  lastWdtKick   = millis();
+
+  disableLoopWDT();
+  esp_task_wdt_init(30, false); 
 
   safeDelay(500);
 
@@ -450,6 +507,7 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, !RELAY_ACTIVE_HIGH);
 
+  logResetReason();
   logMsg("System initialized (staggered startup)");
 
   lastWifiAttempt = millis();
@@ -463,58 +521,64 @@ void loop() {
   lastLoopStart = now;
 
   if (loopDelta > 1000) {
-    logMsg("⚠️ LOOP DELAY: " + String(loopDelta) + " ms");
+    logMsg("LOOP DELAY: " + String(loopDelta) + " ms");
   }
 
   if (millis() - lastWdtKick > 4000) {
-    logMsg("🔥 ABOUT TO MISS WDT");
+    logMsg("ABOUT TO MISS WDT");
   }
 
   kickWatchdog();
-  manageWiFi();
+  wdtStatusLog();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    if (servicesInitStarted) {
-      if (!mqttReady && now - initStartMs > 2000) {
-        logMsg("Starting services (MQTT/NTP/syslog)");
+  inFlashPhase = relayActive && (millis() - relayStartMs) >= RELAY_SOLID_MS;
 
-        udpSyslog.begin(SYSLOG_LOCAL_PORT);
-        mqtt.setServer(MQTT_HOST, MQTT_PORT);
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  if (!inFlashPhase) {
+    manageWiFi();
 
-        ntpConfigured = true;
-        syslogReady   = true;
-        mqttReady     = true;
+    if (WiFi.status() == WL_CONNECTED) {
+      if (servicesInitStarted) {
+        if (!mqttReady && now - initStartMs > 2000) {
+          logMsg("Starting services (MQTT/NTP/syslog)");
+
+          udpSyslog.begin(SYSLOG_LOCAL_PORT);
+          mqtt.setServer(MQTT_HOST, MQTT_PORT);
+          mqtt.setCallback(mqttCallback);
+          configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+          ntpConfigured = true;
+          syslogReady   = true;
+          mqttReady     = true;
+        }
+
+        if (!otaStarted && now - initStartMs > 5000) {
+          setupOTA();
+        }
       }
 
-      if (!otaStarted && now - initStartMs > 5000) {
-        setupOTA();
+      unsigned long otaStart = millis();
+      kickWatchdog();
+      ArduinoOTA.handle();
+      kickWatchdog();
+      if (millis() - otaStart > 1000) {
+        logMsg("OTA blocking: " + String(millis() - otaStart) + " ms");
       }
-    }
 
-    // OTA with timing instrumentation
-    unsigned long otaStart = millis();
-    kickWatchdog();
-    ArduinoOTA.handle();
-    kickWatchdog();
-    if (millis() - otaStart > 1000) {
-      logMsg("⚠️ OTA blocking: " + String(millis() - otaStart) + " ms");
-    }
+      manageMqtt();
 
-    manageMqtt();
-
-    if (mqtt.connected()) {
-      unsigned long mqttStart = millis();
-      mqtt.loop();
-      if (millis() - mqttStart > 1000) {
-        logMsg("⚠️ MQTT blocking: " + String(millis() - mqttStart) + " ms");
+      if (mqtt.connected()) {
+        unsigned long mqttStart = millis();
+        mqtt.loop();
+        if (millis() - mqttStart > 1000) {
+          logMsg("MQTT blocking: " + String(millis() - mqttStart) + " ms");
+        }
       }
     }
   }
 
   if (!pirArmed && millis() > PIR_ARM_DELAY_MS) {
     pirArmed = true;
-    logMsg("👁️ PIR armed");
+    logMsg("PIR armed");
   }
 
   if (pirArmed) {
@@ -523,7 +587,7 @@ void loop() {
     if (motion && !lastMotion) {
       logMsg(String(EMO_MOTION) + " Motion detected!");
 
-      if (mqtt.connected()) {
+      if (!inFlashPhase && mqtt.connected()) {
         mqtt.publish(MQTT_TOPIC, "Motion detected");
         logMsg(String(EMO_MQTT_SEND) + " MQTT sent");
       }
@@ -539,7 +603,7 @@ void loop() {
   if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL * 1000UL) {
     lastHeartbeat = millis();
 
-    if (mqtt.connected()) {
+    if (!inFlashPhase && mqtt.connected()) {
       mqtt.publish("motion/heartbeat", String(WiFi.RSSI()).c_str());
     }
 
